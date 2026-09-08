@@ -156,10 +156,15 @@ evidence behind each. Both were carried over unmodified in substance from `home-
 
 ## HACS status
 
-Not yet claimed HACS-ready. This is a newly-created repository (ported from
-`home-assistant-entity-role` under PLAT-220); HACS repository-publication metadata (description,
-topics) has not yet been set. See `docs/PLAT-128-production-results.md` for the equivalent
-metadata-gating finding from the source repository.
+Not yet claimed HACS-ready. CI confirms `hassfest` and the test suite (HA stable + dev) green;
+**HACS validation currently fails**, and confirmed (this repository's own first CI run, PR #1) to
+fail only on repository-publication metadata this integration's own code cannot set: "The
+repository has no description" and "The repository has no valid topics". Setting a description
+and topics (`home-assistant`, `hacs-integration`, `custom-integration`, `home-automation`) via
+repository Settings or `gh repo edit` — outside what a repository-scoped `git push` can do, and
+outside this session's own permissions (`gh repo edit`/`gh api` were denied) — would resolve this;
+this is the identical metadata-gated finding `docs/PLAT-128-production-results.md` recorded for
+the source repository, carried forward unchanged by this rename.
 
 ## Installation
 
