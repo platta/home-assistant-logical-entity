@@ -1,0 +1,7 @@
+reload:
+  name: Reload
+  description: >-
+    Re-read logical_entity: from configuration.yaml and reconcile running
+    YAML-owned logical entities to it — create, rebind, or remove logical
+    entities as declared, without restarting Home Assistant. Logical
+    entities created through the UI are unaffected.

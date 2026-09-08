@@ -1,0 +1,95 @@
+{
+  "title": "Logical Entity",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Create a logical entity",
+        "description": "A logical entity is a stable indirection bound to a physical entity. Pick what kind of logical entity to create.",
+        "data": {
+          "domain": "Type"
+        }
+      },
+      "source": {
+        "title": "Name and bind",
+        "description": "Choose a name and the implementation entity this logical entity should currently proxy. You can replace it with different hardware later without losing the logical entity's identity.",
+        "data": {
+          "name": "Name",
+          "source": "Implementation entity",
+          "device_class": "Device class"
+        }
+      },
+      "confirm": {
+        "title": "Confirm",
+        "description": "Binding to {source}. Seeded capability contract: {contract}.",
+        "data": {
+          "hide_source": "Hide the implementation entity"
+        }
+      }
+    },
+    "error": {
+      "name_blank": "Name cannot be empty or contain only whitespace.",
+      "source_not_found": "That entity could not be found in the entity registry.",
+      "domain_mismatch": "That entity is not in the logical entity's domain.",
+      "logical_entity_source_rejected": "A logical entity cannot be bound to another logical entity (direct bindings between logical entities are rejected)."
+    }
+  },
+  "options": {
+    "step": {
+      "replace_hardware": {
+        "title": "Replace hardware",
+        "description": "Currently bound to {current_source}. Choose the replacement implementation entity.",
+        "data": {
+          "source": "New implementation entity"
+        }
+      },
+      "confirm_downgrade": {
+        "title": "Confirm capability downgrade",
+        "description": "The new hardware cannot deliver: {lost_capabilities}. These capabilities will be removed from the logical entity's contract.",
+        "data": {
+          "confirm": "I understand, proceed"
+        }
+      }
+    },
+    "error": {
+      "source_not_found": "That entity could not be found in the entity registry.",
+      "domain_mismatch": "That entity is not in the logical entity's domain.",
+      "logical_entity_source_rejected": "A logical entity cannot be bound to another logical entity (direct bindings between logical entities are rejected)."
+    }
+  },
+  "issues": {
+    "logical_entity_unbound": {
+      "title": "{logical_entity_name} needs replacement hardware",
+      "description": "The entity previously bound to {entity_id} was removed from the registry. The logical entity has been preserved and is unavailable. Open its Configure button to bind replacement hardware."
+    },
+    "logical_entity_unbound_fixable": {
+      "title": "{logical_entity_name} needs replacement hardware",
+      "fix_flow": {
+        "step": {
+          "replace_hardware": {
+            "title": "Replace hardware",
+            "description": "{title} is unbound. Choose the replacement implementation entity.",
+            "data": {
+              "source": "New implementation entity"
+            }
+          },
+          "confirm_downgrade": {
+            "title": "Confirm capability downgrade",
+            "description": "The new hardware cannot deliver: {lost_capabilities}. These capabilities will be removed from the logical entity's contract.",
+            "data": {
+              "confirm": "I understand, proceed"
+            }
+          }
+        },
+        "error": {
+          "source_not_found": "That entity could not be found in the entity registry.",
+          "domain_mismatch": "That entity is not in the logical entity's domain.",
+          "logical_entity_source_rejected": "A logical entity cannot be bound to another logical entity (direct bindings between logical entities are rejected)."
+        }
+      }
+    },
+    "yaml_record_invalid": {
+      "title": "Invalid logical_entity YAML record: {logical_id}",
+      "description": "This record was not applied ({reason}); every other declared logical entity is unaffected. Fix the record in the source file and reload."
+    }
+  }
+}

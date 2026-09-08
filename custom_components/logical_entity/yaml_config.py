@@ -1,0 +1,437 @@
+"""Declarative (YAML) configuration source for Logical Entity (design §6.1,
+§6.3).
+
+Domain-key YAML only (`logical_entity:` — see ADR-0007 compliance in design
+§6.5): the parsed record list is split by domain and dispatched to each
+platform via homeassistant.helpers.discovery.async_load_platform, so no
+platform-key YAML (`light: {platform: logical_entity}`) is ever required or
+accepted. Reload re-reads the file via
+homeassistant.helpers.reload.async_integration_yaml_config (the same helper
+template/__init__.py::_reload_config uses, verified in design §2.3/§10.1 R7)
+and reconciles running logical entities to it *in place* rather than
+unloading and recreating them — see async_reconcile_yaml_logical_entities
+docstring for the R7 failure-mode contract this depends on.
+
+**`name` required (PLAT-150) — compatibility for a pre-existing record that
+omits it:** `LOGICAL_ENTITY_SCHEMA` now rejects a record with a missing or
+blank/whitespace-only `name` as `schema_invalid`, exactly like any other
+per-record schema violation — it flows through the same R7 degrade path
+(`_validate_records` -> `_RecordError` -> `ISSUE_YAML_RECORD_INVALID` repair
+issue) rather than a bespoke migration mechanism. The practical effect
+differs by when the record is (re-)evaluated:
+
+* **Live reload** (`logical_entity.reload`, no HA restart) of a logical
+  entity that was already running: the record becomes "declared but
+  invalid" (`invalid_but_declared` below) and, per R7's last-known-good
+  contract, its already-constructed entity is left completely untouched —
+  same bound source, same previously-set display name — while the repair
+  issue nudges the author to add `name:`. No identity/name change happens
+  silently.
+* **A cold HA restart** after upgrading past this record's
+  `DATA_YAML_LOGICAL_ENTITIES` reset to empty every reconcile, a name-less
+  record is invalid from the first evaluation and is simply never
+  constructed — no "declared but invalid" carry-forward applies, since
+  there is no prior running instance in the same session to preserve. The
+  logical entity goes fully unavailable (not "silently renamed"; the
+  pre-existing HA entity-registry entry, if any, keeps whatever name was
+  last recorded in the registry) with the same repair issue surfaced, until
+  `name:` is added and the file reloads/HA restarts again.
+
+Not evidence of a released/versioned config format needing a version-gated
+migration: `manifest.json` is pre-1.0, there are no git tags/HACS releases,
+and `YAML_SCHEMA_VERSION` (const.py) has never been wired to any actual
+migration logic — this repository has no external users to migrate yet.
+The R7 degrade-with-repair-issue path above is this integration's existing,
+already-tested idiom for exactly this class of "record became invalid under
+new code" case, reused here rather than inventing a new one.
+
+**Predeclared, unbound logical entities (PLAT-151) — `source` optional:**
+`LOGICAL_ENTITY_SCHEMA` accepts a record with `source: null` or `source`
+omitted entirely (both normalize to `None` via the field's `default=None`)
+so the complete intended household logical-entity inventory can be declared
+in Git — stable `logical_id` and `name` included — before any physical
+device is migrated into Home Assistant. This is deliberately *not* the same
+code path as an invalid record: an unbound logical entity is a normal,
+successfully-validated record (`valid`, never `errors`/`_RecordError`), so
+no `ISSUE_YAML_RECORD_INVALID` repair issue is raised for it — predeclaring
+is the intended, expected state during migration, not a defect to nudge the
+author to fix. It is also a distinct condition from
+`ISSUE_UNBOUND`/`ISSUE_UNBOUND_FIXABLE` (entity.py,
+`_handle_source_unbound`): those exist specifically to flag that a source
+*was bound and then disappeared* — an anomaly worth surfacing in Settings →
+Repairs — whereas a predeclared logical entity was simply never bound yet,
+which is not an anomaly. Both conditions produce the identical runtime shape
+(`LogicalEntity(source_entity_id=None)`, `available=False`) and share every
+downstream behavior — availability, capability-contract fallback, hide/
+device-association no-ops — see entity.py's `contract_intersect_iterable`/
+`contract_intersect_bitmask` and `async_added_to_hass` docstrings/comments.
+
+A predeclared logical entity's `_resolved_source` is `None` like any other
+unbound logical entity's, so it flows through
+`async_reconcile_yaml_logical_entities`'s existing "Existing: rebind in
+place" comparison unchanged: when a later Git commit adds a real `source:`
+to an already-declared logical_id, `entity.source_entity_id` (`None`)
+differs from the freshly-resolved `record["_resolved_source"]`, so the
+already-running entity is rebound via `async_rebind` in place — same
+`unique_id`/`entity_id`, no new entity, no consumer-visible identity change
+(design §4's stability guarantee, extended to the "never bound yet" starting
+state). The reverse — editing `source:` back to `null` on a previously-bound
+logical entity — takes the identical comparison branch and unbinds the
+running entity the same way, rather than removing it (a logical_id remains
+"declared" whether or not its `source` is currently non-null; only a
+logical_id genuinely absent from the file is "removed", per the
+`declared_logical_ids` comment below).
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.typing import ConfigType
+
+from .const import (
+    CONF_CAPABILITY_CONTRACT,
+    CONF_DEVICE_CLASS,
+    CONF_DOMAIN,
+    CONF_HIDE_SOURCE,
+    CONF_LOGICAL_ID,
+    CONF_NAME,
+    CONF_SOURCE,
+    DATA_YAML_LOGICAL_ENTITIES,
+    DEFAULT_HIDE_SOURCE,
+    DOMAIN,
+    ISSUE_YAML_RECORD_INVALID,
+    SUPPORTED_DOMAINS,
+)
+from .helpers import SourceValidationError, async_validate_source
+
+_LOGGER = logging.getLogger(__name__)
+
+# PLAT-220: the integration's own domain (and hence the entity registry's
+# `platform` field for every entity it registers) changed from "entity_role"
+# to "logical_entity" in this rename. The entity registry keys each entry on
+# (domain, platform, unique_id), so a YAML-declared logical_id whose text is
+# unchanged from its old role_id (as this repository's own migration
+# preserves — see docs/PLAT-220-rename-to-logical-entity.md) would otherwise
+# register as a *new* registry entry under the new platform, leaving the old
+# entry orphaned and forcing a collision-avoidance suffix (e.g.
+# `light.office_test_light_2`) onto the entity_id that every automation,
+# scene, dashboard, and HomeKit binding actually references — defeating the
+# one guarantee this integration exists to provide, at the exact moment of
+# migration. `_migrate_legacy_entity_role_entry` below closes that gap: a
+# one-time, idempotent lookup-and-adopt via the framework's own
+# `entity_registry.async_update_entity_platform` (core's documented API for
+# "migrated between integrations"), run for each newly-declared logical_id
+# before it is ever dispatched to a platform. This constant, and the
+# function below, are a deliberately temporary PLAT-220 compatibility shim,
+# not a generic renaming feature — safe to remove once no production
+# deployment still carries a legacy `entity_role`-platform registry entry.
+LEGACY_ENTITY_ROLE_PLATFORM = "entity_role"
+
+
+def _migrate_legacy_entity_role_entry(hass: HomeAssistant, domain: str, logical_id: str) -> None:
+    """Adopt a pre-PLAT-220 `entity_role`-platform registry entry onto the
+    `logical_entity` platform, in place, so its entity_id survives the
+    integration-domain rename.
+
+    No-op when there is no such legacy entry — a genuinely new logical
+    entity, a deployment that never ran the old integration, or one already
+    migrated on a previous reconcile (after migration the entry's platform
+    is `logical_entity`, so this exact lookup no longer finds it under
+    `LEGACY_ENTITY_ROLE_PLATFORM`).
+
+    Defensive, not load-bearing on failure: `async_update_entity_platform`
+    refuses to migrate an entity that is already loaded, or one still tied
+    to a config entry without an explicit `new_config_entry_id` (design
+    §6.1 — a YAML-owned logical entity has neither, so neither guard should
+    ever actually fire here, but this must not crash HA startup if some
+    unanticipated legacy state does trip one of them). Logged and left for
+    manual/owner cleanup rather than raised.
+    """
+    registry = er.async_get(hass)
+    legacy_entity_id = registry.async_get_entity_id(domain, LEGACY_ENTITY_ROLE_PLATFORM, logical_id)
+    if legacy_entity_id is None:
+        return
+    try:
+        registry.async_update_entity_platform(legacy_entity_id, DOMAIN)
+    except ValueError:
+        _LOGGER.warning(
+            "logical_entity: could not migrate legacy entity_role registry "
+            "entry %s (logical_id=%s) onto the logical_entity platform; it "
+            "will be left in place and a new entity_id may be assigned to "
+            "the replacement logical entity",
+            legacy_entity_id,
+            logical_id,
+            exc_info=True,
+        )
+    else:
+        _LOGGER.info(
+            "logical_entity: migrated legacy entity_role registry entry "
+            "%s (logical_id=%s) onto the logical_entity platform",
+            legacy_entity_id,
+            logical_id,
+        )
+
+
+def _non_blank_string(value: Any) -> str:
+    """`cv.string` plus a blank/whitespace-only rejection (PLAT-150).
+
+    `name` is the logical entity's durable human-facing identity (design
+    intent per PLAT-150: `logical_id` is machine identity, `source` is the
+    replaceable physical implementation, `name` is what a person sees) — a
+    value that is present but empty or all-whitespace is exactly as useless
+    as an absent one, so it must fail validation the same way rather than
+    silently producing a blank Home Assistant display name.
+    """
+    value = cv.string(value)
+    if not value.strip():
+        raise vol.Invalid("name must not be blank")
+    return value
+
+
+LOGICAL_ENTITY_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_LOGICAL_ID): cv.slug,
+        vol.Required(CONF_DOMAIN): vol.In(SUPPORTED_DOMAINS),
+        # Optional (PLAT-151): a declarative logical entity may predeclare
+        # its logical identity with no source bound yet — `source: null` or
+        # the key omitted entirely, both normalized to `None` here via the
+        # shared `default=None`. `logical_id` and `name` (below) are still
+        # required even while unbound: the whole point is that the logical
+        # entity's stable identity exists in Git *before* migration binds it
+        # to hardware. A present-but-non-null value keeps going through the
+        # exact same `cv.string` + async_validate_source bind-time check as
+        # before — see _validate_records — so an invalid non-null source
+        # (typo, wrong-domain entity, logical-entity-on-logical-entity)
+        # still degrades that record with a repair issue exactly as it
+        # always has.
+        vol.Optional(CONF_SOURCE, default=None): vol.Any(None, cv.string),
+        # Required (PLAT-150): a declarative logical entity's human-facing
+        # display name must be explicit — it must never fall back to
+        # `logical_id` (a machine-identity slug) as it silently did before.
+        # See this module's docstring reference and the platform
+        # `from_yaml_record` classmethods
+        # (light.py/switch.py/binary_sensor.py), which now read
+        # `record[CONF_NAME]` directly instead of defaulting it.
+        vol.Required(CONF_NAME): _non_blank_string,
+        vol.Optional(CONF_CAPABILITY_CONTRACT, default=dict): dict,
+        vol.Optional(CONF_DEVICE_CLASS): cv.string,
+        vol.Optional(CONF_HIDE_SOURCE, default=DEFAULT_HIDE_SOURCE): cv.boolean,
+    }
+)
+
+
+def _ensure_logical_entity_records(value: Any) -> list[Any]:
+    """Normalize the raw `logical_entity:` YAML value to a list of records.
+
+    Delegates to `cv.ensure_list` for the general case, but first treats a
+    blank/absent value as "zero declared logical entities" rather than
+    letting `cv.ensure_list` wrap it into a single-item list. This matters
+    because a valid empty declaration — `logical_entity: []` directly, or an
+    `!include` resolving to an empty file — must mean zero logical entities,
+    not one empty record:
+
+    * `logical_entity:` with no value parses to `None`.
+    * `homeassistant.util.yaml.loader._include_yaml` itself substitutes an
+      empty *dict* (`NodeDictClass()`) whenever the included file's content
+      parses to `None` — e.g. a fresh GitOps-owned file that is empty or
+      contains only comments, the bootstrap/recovery state this integration
+      must support (see PLAT-144).
+
+    Without this, `cv.ensure_list({})` wraps that empty dict into `[{}]`,
+    and per-record validation against `LOGICAL_ENTITY_SCHEMA` then fails
+    with `required key not provided` for every required field, exactly as
+    if a single, entirely blank record had been declared. A genuine
+    single-record shorthand (a non-empty dict) still wraps normally, and an
+    explicit list — empty or not — passes through unchanged.
+    """
+    if value is None or value == {}:
+        return []
+    return cv.ensure_list(value)
+
+
+LOGICAL_ENTITY_LIST_SCHEMA = vol.All(_ensure_logical_entity_records, [LOGICAL_ENTITY_SCHEMA])
+
+
+class _RecordError(Exception):
+    def __init__(self, logical_id: str, reason: str) -> None:
+        super().__init__(reason)
+        self.logical_id = logical_id
+        self.reason = reason
+
+
+def _validate_records(
+    hass: HomeAssistant, raw_records: list[dict[str, Any]]
+) -> tuple[dict[str, dict[str, Any]], list[_RecordError]]:
+    """Schema-parse + bind-validate every record.
+
+    A record that fails validation is reported but does not reject the rest
+    of the file (design §10.1 R7's per-record degrade) — the file as a whole
+    is only ever "invalid" upstream, at YAML-syntax/top-level-schema level,
+    handled by async_integration_yaml_config before this function is called
+    at all (see async_reconcile_yaml_logical_entities docstring).
+    """
+    valid: dict[str, dict[str, Any]] = {}
+    errors: list[_RecordError] = []
+    seen_logical_ids: set[str] = set()
+
+    for raw in raw_records:
+        try:
+            record = dict(LOGICAL_ENTITY_SCHEMA(raw))
+        except vol.Invalid as err:
+            logical_id = raw.get(CONF_LOGICAL_ID, "<unknown>") if isinstance(raw, dict) else "<unknown>"
+            errors.append(_RecordError(logical_id, f"schema_invalid: {err}"))
+            continue
+
+        logical_id = record[CONF_LOGICAL_ID]
+        if logical_id in seen_logical_ids:
+            errors.append(_RecordError(logical_id, "duplicate_logical_id"))
+            continue
+        seen_logical_ids.add(logical_id)
+
+        source = record[CONF_SOURCE]
+        if source is None:
+            # Predeclared, unbound (PLAT-151): no candidate to bind-validate
+            # against yet. Not an error — see LOGICAL_ENTITY_SCHEMA's
+            # comment above.
+            record["_resolved_source"] = None
+        else:
+            try:
+                resolved = async_validate_source(
+                    hass, record[CONF_DOMAIN], source
+                )
+            except SourceValidationError as err:
+                errors.append(_RecordError(logical_id, str(err)))
+                continue
+            record["_resolved_source"] = resolved
+
+        valid[logical_id] = record
+
+    return valid, errors
+
+
+async def async_setup_yaml(hass: HomeAssistant, config: ConfigType) -> None:
+    hass.data.setdefault(DOMAIN, {}).setdefault(DATA_YAML_LOGICAL_ENTITIES, {})
+    if DOMAIN not in config:
+        return
+    await async_reconcile_yaml_logical_entities(hass, config)
+
+
+async def async_reconcile_yaml_logical_entities(
+    hass: HomeAssistant, config: ConfigType | None
+) -> None:
+    """Reconcile running YAML-owned logical entities to the given parsed
+    configuration.
+
+    Callers (async_setup_yaml, the reload service handler) are responsible
+    for the file-level failure mode: when
+    `helpers.reload.async_integration_yaml_config` returns None for an
+    unparseable file or a top-level-schema-invalid one, this function must
+    not be called at all — the caller leaves the last-known-good running
+    logical entities untouched, which is `template`'s own verified behavior
+    for the same failure (design §10.1 R7). This function only ever sees a
+    syntactically valid `config`, and handles *record*-level invalidity
+    itself: a bad record is flagged via repair issue and every other
+    logical entity reconciles normally.
+    """
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    current: dict[str, dict[str, Any]] = domain_data.setdefault(DATA_YAML_LOGICAL_ENTITIES, {})
+    logical_entities: dict[str, Any] = domain_data.setdefault("logical_entities", {})
+
+    raw_records = list((config or {}).get(DOMAIN, []))
+    valid, errors = _validate_records(hass, raw_records)
+
+    for error in errors:
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"{ISSUE_YAML_RECORD_INVALID}_{error.logical_id}",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=ISSUE_YAML_RECORD_INVALID,
+            translation_placeholders={"logical_id": error.logical_id, "reason": error.reason},
+        )
+        _LOGGER.warning("logical_entity YAML record %s invalid: %s", error.logical_id, error.reason)
+
+    # Clear stale issues for records that are valid again.
+    for logical_id in valid:
+        ir.async_delete_issue(hass, DOMAIN, f"{ISSUE_YAML_RECORD_INVALID}_{logical_id}")
+
+    # A logical_id still present in the file — valid or not — is "declared".
+    # Only a logical_id genuinely absent from the file is "removed" (design
+    # §10.1 R7's last-known-good contract, DECISION — ChatGPT PLAT-126
+    # 2026-09-02T12:14 ET: a logical entity that is *still declared but now
+    # invalid* must keep its prior running binding/state, not be deleted —
+    # that distinction is exactly what declared_logical_ids draws. Errors
+    # with no recoverable logical_id ("<unknown>" — e.g. the logical_id
+    # field itself is missing/malformed) can never match a running logical
+    # entity and are excluded.
+    declared_logical_ids = set(valid) | {e.logical_id for e in errors if e.logical_id != "<unknown>"}
+    invalid_but_declared = declared_logical_ids - set(valid)
+
+    # Removed: previously YAML-owned, no longer declared in the file at all.
+    for logical_id in set(current) - declared_logical_ids:
+        entity = logical_entities.get(logical_id)
+        if entity is not None:
+            await entity.async_remove(force_remove=True)
+        current.pop(logical_id, None)
+
+    # New: declared now, not previously running — batched per domain since
+    # async_load_platform dispatches one platform setup call per (component,
+    # discovery) pair. Before dispatch, give every genuinely new logical_id
+    # a chance to adopt a matching legacy entity_role registry entry
+    # (PLAT-220 migration, see _migrate_legacy_entity_role_entry above) —
+    # must happen here, for every domain, before any discovery dispatch
+    # below, since async_update_entity_platform refuses to migrate an
+    # entity that has already been loaded this session.
+    by_domain: dict[str, list[dict[str, Any]]] = {}
+    for logical_id, record in valid.items():
+        if logical_id in current:
+            continue
+        _migrate_legacy_entity_role_entry(hass, record[CONF_DOMAIN], logical_id)
+        by_domain.setdefault(record[CONF_DOMAIN], []).append(record)
+
+    for domain, records in by_domain.items():
+        await discovery.async_load_platform(
+            hass, domain, DOMAIN, {"logical_entities": records}, {DOMAIN: raw_records}
+        )
+
+    # Existing: rebind in place rather than unload/recreate, so identity
+    # (unique_id -> HomeKit aid) and consumer references are undisturbed
+    # across a reload — the "candidate refinement" flagged in design §10.2
+    # #4, adopted here as the implemented behavior (see spike results).
+    for logical_id, record in valid.items():
+        if logical_id not in current:
+            continue
+        entity = logical_entities.get(logical_id)
+        if entity is None:
+            continue
+        record_hide_source = record[CONF_HIDE_SOURCE]
+        if (
+            entity.source_entity_id != record["_resolved_source"]
+            or entity.contract != record[CONF_CAPABILITY_CONTRACT]
+            or entity.hide_source != record_hide_source
+        ):
+            await entity.async_rebind(
+                record[CONF_SOURCE], record[CONF_CAPABILITY_CONTRACT], record_hide_source
+            )
+
+    # Track last-known-good for logical entities still declared but
+    # currently invalid, instead of dropping them: their entity was never
+    # touched above, so their tracked record must keep pointing at what it
+    # is actually still bound to. A later reconcile with a corrected record
+    # then finds logical_id already in `current` and takes the in-place
+    # rebind path above, rather than being treated as a brand-new logical
+    # entity.
+    new_tracked: dict[str, dict[str, Any]] = dict(valid)
+    for logical_id in invalid_but_declared:
+        if logical_id in current:
+            new_tracked[logical_id] = current[logical_id]
+    domain_data[DATA_YAML_LOGICAL_ENTITIES] = new_tracked

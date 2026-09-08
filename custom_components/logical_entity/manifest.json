@@ -1,0 +1,13 @@
+{
+  "domain": "logical_entity",
+  "name": "Logical Entity",
+  "codeowners": ["@platta"],
+  "config_flow": true,
+  "documentation": "https://github.com/platta/home-assistant-logical-entity",
+  "integration_type": "helper",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/platta/home-assistant-logical-entity/issues",
+  "quality_scale": "internal",
+  "requirements": [],
+  "version": "0.1.0"
+}
