@@ -1,0 +1,187 @@
+# Logical Entity
+
+A [Home Assistant](https://www.home-assistant.io/) custom integration that gives you a
+**stable logical entity** — `light.kitchen_counter`, say — that keeps its identity (entity ID and
+unique ID) for life, no matter what physical device is currently behind it.
+
+Replace a dead bulb, swap a Zigbee plug for a Matter one, or move a contact sensor to different
+hardware, and every automation, scene, and dashboard card that references the logical entity keeps
+working — untouched. HomeKit accessory identity is *designed* to derive from that same stable
+unique ID (Home Assistant's own HomeKit bridge keys accessories on it), so a logical entity is
+expected to carry its Apple Home accessory across a hardware swap the same way — but that specific
+claim has **not** been validated against a real Apple Home client yet; see the status note below.
+
+> **Status: v1, community-quality.** This repository is the PLAT-220 rename/port of the integration
+> previously developed as `home-assistant-entity-role` — the underlying behavior is unchanged, only
+> the nomenclature: **logical entity** is the stable indirection this integration provides; **role**
+> is reserved for a possible future semantic-classification layer (e.g. `primary_light`,
+> `accent_light`) that does not exist yet. PLAT-126's implementation spike was productionized
+> (PLAT-128): all §4 carry-forward items — config-flow convention verification, source
+> rename/removal tracking, expose-settings migration against the real current HA API, an
+> HA-native repair-issue deep-link for an unbound logical entity, and dedicated UI-vs-YAML ownership
+> regression coverage — are resolved or explicitly, documentedly retained. HA entity
+> identity/rebind/capability-contract/declarative-path behavior is implemented and test-verified
+> in CI. Two things remain **not validated**, honestly: live HomeKit/Apple Home continuity across
+> a rebind (no Apple Home client was reachable from this environment) stays a design expectation,
+> not a proven one; and this repository is not yet claiming HACS-readiness — see
+> [HACS status](#hacs-status) below. See `docs/PLAT-126-spike-results.md` and
+> `docs/PLAT-128-production-results.md` for the original spike/production history (carried over
+> from `home-assistant-entity-role` under its original Entity Role naming) and
+> `docs/PLAT-220-rename-to-logical-entity.md` for the rename itself.
+
+## What it does
+
+- **Create a logical entity** for a light, switch/outlet, or contact (binary) sensor through Home
+  Assistant's normal Settings → Devices & Services → Helpers UI — pick the domain, name it, and
+  point it at the hardware entity it should currently proxy.
+- **Replace hardware** at any time through the logical entity's own Configure → Options flow. Its
+  identity never changes; consumers see a brief state refresh, nothing more.
+- It advertises **`capability contract ∩ current hardware`** — you declare what the logical entity
+  promises (e.g. "this light supports color"), and it only ever exposes what both the contract
+  *and* the currently-bound hardware actually support. A downgrade (swapping in simpler hardware)
+  asks for confirmation and narrows the advertised capabilities; an upgrade stays inert until you
+  widen the contract yourself.
+- If the bound hardware is removed, **the logical entity survives** — it goes unavailable and
+  raises a repair notification, rather than disappearing. Bind replacement hardware whenever
+  you're ready.
+- Everything above works with **zero Git/YAML/automation knowledge required**. A normal
+  Home-Assistant user never has to see anything but the standard Helpers UI.
+
+## Advanced: declarative (YAML) configuration
+
+For deployments that manage Home Assistant configuration as code, logical entities can instead be
+declared under a domain-key `logical_entity:` block and reloaded without restarting HA via the
+`logical_entity.reload` service — the same dual-path pattern Home Assistant's own `template`
+integration uses. A logical entity is owned by exactly one source (UI *or* YAML, never both);
+nothing about the declarative path is visible anywhere in the UI-only experience above.
+
+Each declared logical entity has three distinct identities. `logical_id` and `name` are always
+required; `capability_contract`, `device_class`, and `hide_source` are optional; `source` is
+required to be *present in the schema* but its value may be `null` (or the key omitted) to
+predeclare a logical entity with no hardware bound yet — see
+[Predeclared, unbound logical entities](#predeclared-unbound-logical-entities) below.
+
+- `logical_id` — the durable *machine* identity (the slug behind the entity's
+  `unique_id`/`entity_id`).
+- `name` — the durable *human-facing* identity (what you and Home Assistant's UI actually call the
+  logical entity). Required, and must not be blank/whitespace-only — it is never derived from
+  `logical_id` or from the bound hardware, so replacing the hardware behind a logical entity never
+  changes what it's called.
+- `source` — the *replaceable physical implementation* currently bound to the logical entity (an
+  `entity_id`, or, recommended for Git-managed deployments, an entity-registry UUID — see the
+  design), or `null` if it is not yet bound to anything.
+
+```yaml
+logical_entity:
+  - logical_id: kitchen_counter
+    domain: light
+    source: light.nanoleaf_a19_kitchen   # entity_id, or (recommended for Git-managed
+                                          # deployments) an entity-registry UUID — see the design
+    name: Kitchen Counter
+    capability_contract:
+      supported_color_modes: [hs, color_temp]
+      supported_features: 0
+    hide_source: true
+```
+
+A record missing `name`, or whose `name` is blank/whitespace-only, fails validation with a repair
+issue (Settings → Repairs) rather than falling back to `logical_id` or being silently accepted —
+see `yaml_config.py`'s module docstring for the exact compatibility behavior for a logical entity
+that already existed before `name` became required.
+
+An empty declaration — `logical_entity: []`, or an `!include` pointing at a file that is empty
+or contains only comments — is valid and means zero YAML-owned logical entities; it will not fail
+HA startup. This is the expected state for a fresh GitOps install or a recovery/bootstrap checkout
+before any household logical entities have been declared yet.
+
+### Predeclared, unbound logical entities
+
+A logical entity's `source` may be `null` (or simply omitted), letting you declare the household's
+complete intended logical-entity inventory in Git before any of the physical devices behind it
+have been migrated into Home Assistant:
+
+```yaml
+logical_entity:
+  - logical_id: office_ceiling
+    domain: light
+    name: Office Ceiling
+    source: null
+    capability_contract:
+      supported_color_modes: [color_temp, hs]
+```
+
+An unbound logical entity still registers with its declared `logical_id` and `name` —
+dashboards, automations, and HomeKit can already reference it — but shows as **unavailable** until
+a source is bound. It does *not* raise a repair issue: predeclaring is the expected, intended
+state during a migration, unlike a logical entity whose previously-bound source disappeared (see
+[Recovering an unbound logical entity](#recovering-an-unbound-logical-entity) below, a genuinely
+different condition).
+
+While unbound, a logical entity advertises its **declared `capability_contract` directly** (not
+intersected against any hardware, since there is none yet) — so the intended capabilities are
+visible up front rather than collapsing to nothing. `hide_source` and device-association are
+no-ops until a source exists (there is nothing to hide or link to).
+
+Migrating a device onto a predeclared logical entity is a one-line Git change — add or update its
+`source:` — followed by `logical_entity.reload` (or a normal HA restart). Reconciliation binds the
+already-existing logical entity to the physical source **in place**: identity
+(`unique_id`/`entity_id`) never changes, so nothing downstream needs to reference a new entity.
+The same applies in reverse — setting `source:` back to `null` unbinds the logical entity
+(returning it to unavailable) without removing it; only a `logical_id` genuinely absent from the
+file is removed.
+
+## Recovering an unbound logical entity
+
+If a logical entity's bound hardware is removed from Home Assistant, it survives unavailable and
+raises a repair issue (Settings → Repairs). Selecting **Fix** on that issue opens the same
+"pick a replacement" step as its own Configure → Options flow, directly from the repair — no need
+to separately find it first.
+
+## Supported domains (v1)
+
+`light`, `switch` (including the `outlet` device class), `binary_sensor` (e.g. `door`/`window`).
+
+## Design
+
+This integration implements the accepted design
+`PLAT-125-hardware-role-abstraction-design.md` (Plattsoft `gitops` repository,
+merge commit `af668725e9c632b12ba9c7dfc7c4e83df631250c`). That document is the authoritative
+architecture reference and still uses the original "Entity Role" naming; see
+`docs/PLAT-220-rename-to-logical-entity.md` for the terminology mapping this repository applies on
+top of it. `docs/PLAT-126-spike-results.md` records the initial bounded spike's gate-by-gate
+results; `docs/PLAT-128-production-results.md` records the production pass — including two
+verified decisions to retain the spike's manual config-flow base classes and custom
+source-tracking listener rather than adopt newer core helpers cited in the design, with the
+evidence behind each. Both were carried over unmodified in substance from `home-assistant-entity-role`.
+
+## HACS status
+
+Not yet claimed HACS-ready. This is a newly-created repository (ported from
+`home-assistant-entity-role` under PLAT-220); HACS repository-publication metadata (description,
+topics) has not yet been set. See `docs/PLAT-128-production-results.md` for the equivalent
+metadata-gating finding from the source repository.
+
+## Installation
+
+Via [HACS](https://hacs.xyz/) as a custom repository (`platta/home-assistant-logical-entity`,
+category "Integration"), or manually by copying `custom_components/logical_entity/` into your
+Home Assistant `config/custom_components/` directory and restarting.
+
+## Development
+
+```console
+python3 -m venv .venv && .venv/bin/python -m pip install -r requirements_test.txt
+.venv/bin/python -m pytest
+```
+
+CI runs `hassfest`, HACS validation, and the test suite against both the current stable and the
+`dev` (RC) branch of Home Assistant core — always resolving genuinely current package releases.
+A local sandboxed dev environment's package index may be frozen well behind the real PyPI/GitHub
+state (observed directly during PLAT-128, on the source repository: a `pip install homeassistant`
+with no version pin resolved no newer than a `2025.1.4` release from one such index, versus CI
+correctly resolving the real current stable/dev releases) — treat CI, not a local install's
+version, as the authority on "current supported HA APIs" if the two ever disagree.
+
+## License
+
+MIT — see `LICENSE`.
