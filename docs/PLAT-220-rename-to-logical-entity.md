@@ -80,6 +80,38 @@ translation placeholders keep their names; only the record-identity placeholder 
   step, not part of this rename commit, so as not to leave the production Home Assistant
   instance without a working integration mid-migration.
 
+## Entity-registry migration across the domain rename
+
+Renaming the integration's own domain (`entity_role` → `logical_entity`) is not cosmetic to Home
+Assistant's entity registry: every entry is keyed on `(domain, platform, unique_id)`, and
+`platform` is the *integration* domain, not the record's `logical_id`/`domain` field. A
+YAML-declared logical entity whose `logical_id` text is unchanged from its old `role_id` (as this
+rename preserves — see the table above) would, without an explicit migration step, still register
+as a **new, distinct** registry entry once `platform` changes: the old `(light, entity_role,
+office_test_light)` entry is left orphaned holding `light.office_test_light`, and the new
+`(light, logical_entity, office_test_light)` entry collides on that entity_id, forcing Home
+Assistant's own collision-avoidance suffix (`light.office_test_light_2`) onto the replacement —
+breaking the exact identity guarantee this integration exists to provide, at the moment of
+migration, for every automation/scene/dashboard/HomeKit reference to the old entity_id.
+
+This was identified during PLAT-220's adjudication (`ESCALATION — Opus`, confirmed and required
+by `DECISION — ChatGPT`) and is closed by `yaml_config.py`'s
+`_migrate_legacy_entity_role_entry`: for each newly-declared `logical_id`, before it is ever
+dispatched to a platform, look up a matching `(domain, "entity_role", logical_id)` registry entry
+and — if found — adopt it onto the `logical_entity` platform in place via Home Assistant's own
+`entity_registry.async_update_entity_platform` (core's documented API for migrating an entity
+between integrations), preserving its existing `entity_id`. No-op when there is no such legacy
+entry (a genuinely new logical entity, a deployment that never ran the old integration, or one
+already migrated on an earlier reconcile). Covered by
+`tests/test_legacy_entity_role_migration.py`, including a negative control confirming the test
+suite actually goes red (reproducing the exact `light.office_test_light_2` collision) with the
+migration call removed.
+
+This is a deliberately temporary, PLAT-220-specific compatibility shim — not a generic renaming
+feature — and is safe to delete once no production deployment still carries a legacy
+`entity_role`-platform registry entry (i.e. once the migration has actually run against the one
+production instance this integration is deployed to).
+
 ## Non-goal: a future "role" layer
 
 Nothing here precludes a later, separate semantic-classification layer built *on top of*

@@ -92,6 +92,7 @@ import voluptuous as vol
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv, discovery
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.typing import ConfigType
 
@@ -112,6 +113,71 @@ from .const import (
 from .helpers import SourceValidationError, async_validate_source
 
 _LOGGER = logging.getLogger(__name__)
+
+# PLAT-220: the integration's own domain (and hence the entity registry's
+# `platform` field for every entity it registers) changed from "entity_role"
+# to "logical_entity" in this rename. The entity registry keys each entry on
+# (domain, platform, unique_id), so a YAML-declared logical_id whose text is
+# unchanged from its old role_id (as this repository's own migration
+# preserves — see docs/PLAT-220-rename-to-logical-entity.md) would otherwise
+# register as a *new* registry entry under the new platform, leaving the old
+# entry orphaned and forcing a collision-avoidance suffix (e.g.
+# `light.office_test_light_2`) onto the entity_id that every automation,
+# scene, dashboard, and HomeKit binding actually references — defeating the
+# one guarantee this integration exists to provide, at the exact moment of
+# migration. `_migrate_legacy_entity_role_entry` below closes that gap: a
+# one-time, idempotent lookup-and-adopt via the framework's own
+# `entity_registry.async_update_entity_platform` (core's documented API for
+# "migrated between integrations"), run for each newly-declared logical_id
+# before it is ever dispatched to a platform. This constant, and the
+# function below, are a deliberately temporary PLAT-220 compatibility shim,
+# not a generic renaming feature — safe to remove once no production
+# deployment still carries a legacy `entity_role`-platform registry entry.
+LEGACY_ENTITY_ROLE_PLATFORM = "entity_role"
+
+
+def _migrate_legacy_entity_role_entry(hass: HomeAssistant, domain: str, logical_id: str) -> None:
+    """Adopt a pre-PLAT-220 `entity_role`-platform registry entry onto the
+    `logical_entity` platform, in place, so its entity_id survives the
+    integration-domain rename.
+
+    No-op when there is no such legacy entry — a genuinely new logical
+    entity, a deployment that never ran the old integration, or one already
+    migrated on a previous reconcile (after migration the entry's platform
+    is `logical_entity`, so this exact lookup no longer finds it under
+    `LEGACY_ENTITY_ROLE_PLATFORM`).
+
+    Defensive, not load-bearing on failure: `async_update_entity_platform`
+    refuses to migrate an entity that is already loaded, or one still tied
+    to a config entry without an explicit `new_config_entry_id` (design
+    §6.1 — a YAML-owned logical entity has neither, so neither guard should
+    ever actually fire here, but this must not crash HA startup if some
+    unanticipated legacy state does trip one of them). Logged and left for
+    manual/owner cleanup rather than raised.
+    """
+    registry = er.async_get(hass)
+    legacy_entity_id = registry.async_get_entity_id(domain, LEGACY_ENTITY_ROLE_PLATFORM, logical_id)
+    if legacy_entity_id is None:
+        return
+    try:
+        registry.async_update_entity_platform(legacy_entity_id, DOMAIN)
+    except ValueError:
+        _LOGGER.warning(
+            "logical_entity: could not migrate legacy entity_role registry "
+            "entry %s (logical_id=%s) onto the logical_entity platform; it "
+            "will be left in place and a new entity_id may be assigned to "
+            "the replacement logical entity",
+            legacy_entity_id,
+            logical_id,
+            exc_info=True,
+        )
+    else:
+        _LOGGER.info(
+            "logical_entity: migrated legacy entity_role registry entry "
+            "%s (logical_id=%s) onto the logical_entity platform",
+            legacy_entity_id,
+            logical_id,
+        )
 
 
 def _non_blank_string(value: Any) -> str:
@@ -319,11 +385,17 @@ async def async_reconcile_yaml_logical_entities(
 
     # New: declared now, not previously running — batched per domain since
     # async_load_platform dispatches one platform setup call per (component,
-    # discovery) pair.
+    # discovery) pair. Before dispatch, give every genuinely new logical_id
+    # a chance to adopt a matching legacy entity_role registry entry
+    # (PLAT-220 migration, see _migrate_legacy_entity_role_entry above) —
+    # must happen here, for every domain, before any discovery dispatch
+    # below, since async_update_entity_platform refuses to migrate an
+    # entity that has already been loaded this session.
     by_domain: dict[str, list[dict[str, Any]]] = {}
     for logical_id, record in valid.items():
         if logical_id in current:
             continue
+        _migrate_legacy_entity_role_entry(hass, record[CONF_DOMAIN], logical_id)
         by_domain.setdefault(record[CONF_DOMAIN], []).append(record)
 
     for domain, records in by_domain.items():

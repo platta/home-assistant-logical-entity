@@ -157,14 +157,19 @@ evidence behind each. Both were carried over unmodified in substance from `home-
 ## HACS status
 
 Not yet claimed HACS-ready. CI confirms `hassfest` and the test suite (HA stable + dev) green;
-**HACS validation currently fails**, and confirmed (this repository's own first CI run, PR #1) to
-fail only on repository-publication metadata this integration's own code cannot set: "The
-repository has no description" and "The repository has no valid topics". Setting a description
-and topics (`home-assistant`, `hacs-integration`, `custom-integration`, `home-automation`) via
-repository Settings or `gh repo edit` — outside what a repository-scoped `git push` can do, and
-outside this session's own permissions (`gh repo edit`/`gh api` were denied) — would resolve this;
-this is the identical metadata-gated finding `docs/PLAT-128-production-results.md` recorded for
-the source repository, carried forward unchanged by this rename.
+**HACS validation currently fails**, and confirmed (this repository's own CI, PR #1) to fail only
+on repository-publication metadata this integration's own code cannot set: "The repository has no
+description" and "The repository has no valid topics". This is an **owner-only repository-settings
+action** — setting a description and topics (`home-assistant`, `hacs-integration`,
+`custom-integration`, `home-automation` suggested) via repository Settings or `gh repo edit` would
+resolve it, but is outside what a repository-scoped `git push` can do, and `gh repo edit`/`gh api`
+were both attempted and denied under this session's own permissions.
+
+`docs/PLAT-128-production-results.md` records the identical shape of finding for the source
+repository (`home-assistant-entity-role`) — but that gap was subsequently **closed** there (its
+description and topics are both set today), not left open or accepted as-is. This new repository
+simply has not had the same one-time owner action applied yet; it is not evidence that the gap is
+acceptable to carry indefinitely, only that it needs the same owner action repeated here.
 
 ## Installation
 
